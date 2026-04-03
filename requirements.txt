@@ -1,12 +1,21 @@
-pip>=23.0
-setuptools>=65.0
-wheel
+# Core Bot
 aiogram==3.4.1
-yfinance
-pandas
-numpy
-scipy
-matplotlib
-mplfinance
-apscheduler
-python-dotenv
+
+# Data
+yfinance==1.2.0
+pandas==2.1.1
+numpy==1.26.2
+scipy==1.11.1
+
+# Charting
+matplotlib==3.7.3
+mplfinance==0.12.10b0
+
+# Scheduling & async
+apscheduler==3.11.2
+aiohttp==3.9.5
+aiofiles==23.2.1
+
+# Environment & utilities
+python-dotenv==1.2.2
+typing-extensions==4.7.0
