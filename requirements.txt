@@ -1,18 +1,12 @@
-# Telegram bot
+pip>=23.0
+setuptools>=65.0
+wheel
 aiogram==3.4.1
-
-# Data fetching & processing
 yfinance
 pandas
 numpy
 scipy
-
-# Plotting & charting
 matplotlib
 mplfinance
-
-# Scheduler & async tasks
 apscheduler
-
-# Environment variables
 python-dotenv
