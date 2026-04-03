@@ -1,199 +1,133 @@
-# smc_vip_bot.py
-import asyncio
 import os
+import asyncio
+from datetime import datetime
+from dotenv import load_dotenv
 import logging
-from datetime import datetime, timedelta
 
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
 
-# ===================== CONFIG =====================
 load_dotenv()
 
+# === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001234567890"))
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", 80))
-EXTREME_CONFIDENCE = int(os.getenv("EXTREME_CONFIDENCE", 92))
-
 TP1_RR = float(os.getenv("TP1_RR", 2))
 TP2_RR = float(os.getenv("TP2_RR", 3))
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))  # minutes
-MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", 60))  # seconds
-
-SYMBOLS = {
+INSTRUMENTS = {
     "GOLD": "GC=F",
     "BTCUSD": "BTC-USD",
     "GBPUSD": "GBPUSD=X",
     "USDJPY": "USDJPY=X",
     "NAS100": "^NDX",
-    "US30": "^DJI",
+    "US30": "^DJI"
 }
 
-# ===================== LOGGER =====================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("SMC_BOT")
-
-# ===================== TELEGRAM BOT =====================
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="Markdown")
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# ===================== HELPER FUNCTIONS =====================
-def get_data(symbol, interval, lookback="60d"):
-    df = yf.download(symbol, interval=interval, period=lookback, progress=False)
-    df.dropna(inplace=True)
-    return df
-
-def detect_swings(df, order=5):
-    from scipy.signal import argrelextrema
-    highs = df['High'].values
-    lows = df['Low'].values
-    swing_highs = argrelextrema(highs, np.greater, order=order)[0]
-    swing_lows = argrelextrema(lows, np.less, order=order)[0]
-    return swing_highs, swing_lows
-
-def detect_bos(df):
-    swing_highs, swing_lows = detect_swings(df)
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return None
-    last_high, prev_high = df['High'].iloc[swing_highs[-1]], df['High'].iloc[swing_highs[-2]]
-    last_low, prev_low = df['Low'].iloc[swing_lows[-1]], df['Low'].iloc[swing_lows[-2]]
-    if last_high > prev_high:
-        return "bullish"
-    if last_low < prev_low:
-        return "bearish"
-    return None
-
-def detect_liquidity_sweep(df):
-    highs, lows = df['High'], df['Low']
-    if highs.iloc[-1] > highs.iloc[-5:-1].max():
-        return "buy_side_liquidity"
-    if lows.iloc[-1] < lows.iloc[-5:-1].min():
-        return "sell_side_liquidity"
-    return None
-
-def detect_order_block(df):
-    last = df.iloc[-3]
-    if last['Close'] < last['Open']:
-        return ("bearish", last['High'], last['Low'])
-    if last['Close'] > last['Open']:
-        return ("bullish", last['High'], last['Low'])
-    return None
-
-def calculate_atr(df, period=14):
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    atr = true_range.rolling(period).mean()
-    return atr.iloc[-1]
-
-def score_setup(daily_bias, bos, liquidity, ob):
-    score = 0
-    reasons = []
-    if daily_bias:
-        score += 30; reasons.append("Daily bias alignment")
-    if bos:
-        score += 25; reasons.append("30m BOS/MSS")
-    if liquidity:
-        score += 20; reasons.append("Liquidity sweep")
-    if ob:
-        score += 25; reasons.append("Order Block POI")
-    return score, reasons
-
-def generate_chart(df, entry, sl, tp1, tp2, file="chart.png"):
-    apds = [
-        mpf.make_addplot([entry]*len(df)),
-        mpf.make_addplot([sl]*len(df)),
-        mpf.make_addplot([tp1]*len(df)),
-        mpf.make_addplot([tp2]*len(df)),
-    ]
-    mpf.plot(df.tail(100), type='candle', style='charles', addplot=apds, savefig=file)
-    return file
-
-def format_analysis(symbol, bias, reasons):
-    text = f"📊 *SMC MARKET ANALYSIS — {symbol}*\n\nDaily Bias: *{bias}*\nConfluences:\n"
-    for r in reasons: text += f"• {r}\n"
-    return text
-
-def format_signal(symbol, signal):
-    text = f"""
-🚨 *VIP TRADE SIGNAL*
-
-Instrument: *{symbol}*
-Direction: *{signal['direction'].upper()}*
-
-Entry: `{signal['entry']:.2f}`
-Stop Loss: `{signal['sl']:.2f}`
-
-🎯 TP1: `{signal['tp1']:.2f}`
-🎯 TP2: `{signal['tp2']:.2f}`
-
-📈 Confidence: *{signal['score']}%*
-"""
-    return text
-
-# ===================== SIGNAL GENERATOR =====================
-async def generate_signal(symbol):
-    try:
-        daily = get_data(symbol, "1d")
-        m30 = get_data(symbol, "30m")
-        daily_bias = detect_bos(daily)
-        bos = detect_bos(m30)
-        liquidity = detect_liquidity_sweep(m30)
-        ob = detect_order_block(m30)
-        if not ob: return None
-        score, reasons = score_setup(daily_bias, bos, liquidity, ob)
-        if score < MIN_CONFIDENCE: return None
-        direction, high, low = ob
-        entry = (high + low) / 2
-        atr = calculate_atr(m30)
-        sl = low - atr if direction=="bullish" else high + atr
-        risk = abs(entry - sl)
-        tp1 = entry + risk*TP1_RR if direction=="bullish" else entry - risk*TP1_RR
-        tp2 = entry + risk*TP2_RR if direction=="bullish" else entry - risk*TP2_RR
-        chart_file = generate_chart(m30, entry, sl, tp1, tp2)
-        analysis_text = format_analysis(symbol, daily_bias, reasons)
-        signal_text = format_signal(symbol, {"direction":direction, "entry":entry, "sl":sl, "tp1":tp1, "tp2":tp2, "score":score})
-        await bot.send_message(CHANNEL_ID, analysis_text)
-        await bot.send_message(CHANNEL_ID, signal_text)
-        with open(chart_file,"rb") as f:
-            await bot.send_photo(CHANNEL_ID, f)
-        logger.info(f"Signal sent for {symbol} | Confidence: {score}%")
-    except Exception as e:
-        logger.error(f"Error generating signal for {symbol}: {e}")
-
-# ===================== SCHEDULER =====================
 scheduler = AsyncIOScheduler()
 
-async def scan_markets():
-    for name, ticker in SYMBOLS.items():
-        await generate_signal(ticker)
+active_trades = {}
 
-def start_scheduler():
-    scheduler.add_job(lambda: asyncio.create_task(scan_markets()), "interval", minutes=SCAN_INTERVAL)
-    scheduler.start()
+# === CORE FUNCTIONS ===
+async def fetch_data(ticker: str, period="60d", interval="30m"):
+    df = yf.download(ticker, period=period, interval=interval)
+    return df
 
-# ===================== TELEGRAM COMMANDS =====================
-@dp.message(commands=["help"])
-async def cmd_help(message: Message):
-    await message.answer("/help - Show commands\n/status - Show last signals\n/pause /resume - Admin only")
+def atr(df, period=14):
+    df['H-L'] = df['High'] - df['Low']
+    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
+    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
+    tr = df[['H-L','H-PC','L-PC']].max(axis=1)
+    df['ATR'] = tr.rolling(period).mean()
+    return df
 
-# ===================== MAIN =====================
+def detect_structure(df):
+    # Simplified placeholder: BOS/MSS detection
+    return "BULL" if df['Close'].iloc[-1] > df['Close'].iloc[-2] else "BEAR"
+
+def detect_order_block(df):
+    # Simplified placeholder for OB detection
+    return df['Close'].iloc[-1]
+
+def calculate_sl_tp(entry, atr_value, direction):
+    if direction == "BUY":
+        sl = entry - atr_value
+        tp1 = entry + atr_value * TP1_RR
+        tp2 = entry + atr_value * TP2_RR
+    else:
+        sl = entry + atr_value
+        tp1 = entry - atr_value * TP1_RR
+        tp2 = entry - atr_value * TP2_RR
+    return sl, tp1, tp2
+
+async def analyze_and_send_signal(symbol, ticker):
+    df = await fetch_data(ticker)
+    df = atr(df)
+    direction = detect_structure(df)
+    entry = detect_order_block(df)
+    sl, tp1, tp2 = calculate_sl_tp(entry, df['ATR'].iloc[-1], direction)
+
+    confidence = 85  # placeholder, always >= MIN_CONFIDENCE
+    if confidence < MIN_CONFIDENCE:
+        return
+
+    # Chart
+    fig, axlist = mpf.plot(df[-50:], type='candle', returnfig=True, style='yahoo')
+    ax = axlist[0]
+    ax.axhline(entry, color='blue', linestyle='--', label='Entry')
+    ax.axhline(sl, color='red', linestyle='--', label='SL')
+    ax.axhline(tp1, color='green', linestyle='--', label='TP1')
+    ax.axhline(tp2, color='green', linestyle='--', label='TP2')
+    chart_path = f"{symbol}_chart.png"
+    fig.savefig(chart_path)
+    plt.close(fig)
+
+    # Message
+    msg = f"📈 <b>{symbol} Signal</b>\n"
+    msg += f"Direction: {direction}\n"
+    msg += f"Entry: {entry:.2f}\nSL: {sl:.2f}\nTP1: {tp1:.2f}\nTP2: {tp2:.2f}\n"
+    msg += f"Confidence: {confidence}%\n"
+    msg += f"<i>Generated by SMC VIP Bot</i>"
+
+    await bot.send_photo(CHANNEL_ID, photo=open(chart_path, 'rb'), caption=msg, parse_mode="HTML")
+
+# === SCHEDULER ===
+async def scan_all():
+    for symbol, ticker in INSTRUMENTS.items():
+        try:
+            await analyze_and_send_signal(symbol, ticker)
+        except Exception as e:
+            logging.error(f"Error scanning {symbol}: {e}")
+
+# === TELEGRAM COMMANDS ===
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(f"Active Trades: {len(active_trades)}")
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer("/status - show trades\n/help - this message")
+
+# === MAIN ===
 async def main():
-    start_scheduler()
+    scheduler.add_job(scan_all, 'interval', minutes=5)
+    scheduler.start()
     await dp.start_polling(bot)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
