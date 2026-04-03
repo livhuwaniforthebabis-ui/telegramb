@@ -3,8 +3,8 @@ aiogram==3.4.1
 
 # Data
 yfinance==1.2.0
-pandas==2.1.1
-numpy==1.26.2
+numpy==1.27.4
+pandas==2.2.0.dev0
 scipy==1.11.1
 
 # Charting
